@@ -3,6 +3,7 @@ package com.github.cubeee.bufftracker.ui;
 import com.github.cubeee.bufftracker.model.Buff;
 import net.runelite.client.ui.ColorScheme;
 
+import javax.swing.AbstractButton;
 import javax.swing.BorderFactory;
 import javax.swing.DefaultListCellRenderer;
 import javax.swing.DefaultListModel;
@@ -12,7 +13,6 @@ import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
-import javax.swing.KeyStroke;
 import javax.swing.ListSelectionModel;
 import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingUtilities;
@@ -21,9 +21,7 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.GraphicsConfiguration;
-import java.awt.MouseInfo;
 import java.awt.Point;
-import java.awt.PointerInfo;
 import java.awt.Rectangle;
 import java.awt.Window;
 import java.awt.event.KeyEvent;
@@ -38,9 +36,11 @@ final class BuffPicker extends JDialog {
 
     private static final Dimension SIZE = new Dimension(220, 260);
 
-    // Set on the anchor when a click on it closed the picker, so the same click doesn't reopen it
-    private static final String CLOSED_BY_ANCHOR_KEY = "buffPicker.closedByAnchorAt";
-    private static final long CLOSED_BY_ANCHOR_WINDOW_MS = 1000;
+    // Set on the anchor when the picker closes and when the anchor is pressed. A press on the anchor closes the
+    // picker too, and both happen at about the same time; that click shouldn't reopen it.
+    private static final String CLOSED_AT_KEY = "buffPicker.closedAt";
+    private static final String PRESSED_AT_KEY = "buffPicker.pressedAt";
+    private static final long SAME_CLICK_WINDOW_MS = 250;
 
     private final Consumer<Buff> onPick;
 
@@ -76,8 +76,8 @@ final class BuffPicker extends JDialog {
             list.setSelectedIndex(0);
         }
         // Arrow keys are handled by JList itself
-        list.registerKeyboardAction(e -> pick(list.getSelectedValue()),
-                KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), JComponent.WHEN_FOCUSED);
+        KeyBindings.bind(list, JComponent.WHEN_FOCUSED, KeyEvent.VK_ENTER, "pick",
+                () -> pick(list.getSelectedValue()));
         list.addMouseListener(new MouseAdapter() {
             @Override
             public void mouseClicked(MouseEvent event) {
@@ -102,24 +102,38 @@ final class BuffPicker extends JDialog {
         content.add(scrollPane, BorderLayout.CENTER);
         setContentPane(content);
 
-        getRootPane().registerKeyboardAction(e -> dispose(),
-                KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_IN_FOCUSED_WINDOW);
+        KeyBindings.bind(getRootPane(), JComponent.WHEN_IN_FOCUSED_WINDOW, KeyEvent.VK_ESCAPE, "close", this::dispose);
 
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowDeactivated(WindowEvent event) {
-                if (isPointerOver(anchor)) {
-                    anchor.putClientProperty(CLOSED_BY_ANCHOR_KEY, System.currentTimeMillis());
-                }
+                anchor.putClientProperty(CLOSED_AT_KEY, System.currentTimeMillis());
                 dispose();
             }
         });
     }
 
-    static void toggle(JComponent anchor, List<Buff> buffs, BuffCatalog catalog, Consumer<Buff> onPick) {
-        Object closedAt = anchor.getClientProperty(CLOSED_BY_ANCHOR_KEY);
-        anchor.putClientProperty(CLOSED_BY_ANCHOR_KEY, null);
-        if (closedAt instanceof Long && System.currentTimeMillis() - (Long) closedAt < CLOSED_BY_ANCHOR_WINDOW_MS) {
+    /**
+     * Makes the anchor open the picker below it, or close it when it's already open.
+     */
+    static void attach(AbstractButton anchor, List<Buff> buffs, BuffCatalog catalog, Consumer<Buff> onPick) {
+        anchor.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent event) {
+                anchor.putClientProperty(PRESSED_AT_KEY, event.getWhen());
+            }
+        });
+        anchor.addActionListener(e -> toggle(anchor, buffs, catalog, onPick));
+    }
+
+    private static void toggle(JComponent anchor, List<Buff> buffs, BuffCatalog catalog, Consumer<Buff> onPick) {
+        Object closedAt = anchor.getClientProperty(CLOSED_AT_KEY);
+        Object pressedAt = anchor.getClientProperty(PRESSED_AT_KEY);
+        anchor.putClientProperty(CLOSED_AT_KEY, null);
+        anchor.putClientProperty(PRESSED_AT_KEY, null);
+        // The picker may close just before or just after the press is seen
+        if (closedAt instanceof Long && pressedAt instanceof Long
+                && Math.abs((Long) closedAt - (Long) pressedAt) < SAME_CLICK_WINDOW_MS) {
             return;
         }
 
@@ -140,20 +154,8 @@ final class BuffPicker extends JDialog {
         }
 
         picker.setLocation(location);
+        // The list is the only focusable component, so it gets the focus when the picker opens
         picker.setVisible(true);
-        picker.list.requestFocusInWindow();
-    }
-
-    private static boolean isPointerOver(Component component) {
-        if (!component.isShowing()) {
-            return false;
-        }
-        PointerInfo pointer = MouseInfo.getPointerInfo();
-        if (pointer == null) {
-            return false;
-        }
-        Rectangle bounds = new Rectangle(component.getLocationOnScreen(), component.getSize());
-        return bounds.contains(pointer.getLocation());
     }
 
     private void pick(Buff buff) {

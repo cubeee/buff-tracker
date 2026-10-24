@@ -7,7 +7,6 @@ import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JTextField;
-import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.border.Border;
 import javax.swing.border.EmptyBorder;
@@ -15,15 +14,11 @@ import javax.swing.text.AbstractDocument;
 import javax.swing.text.AttributeSet;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.DocumentFilter;
-import java.awt.AWTEvent;
-import java.awt.CardLayout;
+import java.awt.BorderLayout;
 import java.awt.Color;
-import java.awt.Component;
-import java.awt.Cursor;
 import java.awt.Dimension;
-import java.awt.KeyboardFocusManager;
-import java.awt.Toolkit;
-import java.awt.event.AWTEventListener;
+import java.awt.Graphics;
+import java.awt.Insets;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.awt.event.KeyEvent;
@@ -32,37 +27,24 @@ import java.awt.event.MouseEvent;
 import java.util.function.*;
 
 /**
- * While idle, a JLabel is shown so that long text is truncated with an ellipsis at the end
- * (a JTextField would instead scroll to show the end of the text).
+ * While idle, the field paints a JLabel instead of itself so that long text is truncated with an ellipsis at the end
+ * (a JTextField would instead scroll to show the end of the text). Clicking it focuses it the usual Swing way, which
+ * starts the edit.
  */
 class InlineTextField extends JPanel {
-
-    private static final String IDLE = "idle";
-    private static final String EDIT = "edit";
 
     private static final Border IDLE_BORDER = new EmptyBorder(2, 2, 2, 2);
     private static final Border EDIT_BORDER = BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR),
             new EmptyBorder(1, 1, 1, 1));
 
-    private final CardLayout cards = new CardLayout();
     private final JLabel label;
     private final JTextField field;
     private final String text;
+    private final Predicate<String> onCommit;
     private final Consumer<Boolean> onEditingChanged;
-    // Between gaining focus and losing it permanently
+    // Between starting the edit and committing or dropping it
     private boolean editing;
-
-    // Ends editing when the mouse is pressed anywhere outside the field. Clicking non-focusable components
-    // (panels, labels) would otherwise leave the field focused.
-    private final AWTEventListener clickAwayListener = event -> {
-        // The source isn't always a Component, e.g. for system tray icon events
-        if (event.getID() == MouseEvent.MOUSE_PRESSED
-                && !(event.getSource() instanceof Component
-                        && SwingUtilities.isDescendingFrom((Component) event.getSource(), getField()))) {
-            stopEditing();
-        }
-    };
 
     /**
      * @param maxLength longer input, e.g. pasted text, is cut off
@@ -70,108 +52,129 @@ class InlineTextField extends JPanel {
      */
     InlineTextField(String text, Predicate<String> onCommit, int maxLength, Consumer<Boolean> onEditingChanged) {
         this.text = text;
+        this.onCommit = onCommit;
         this.onEditingChanged = onEditingChanged;
-        setLayout(cards);
+        setLayout(new BorderLayout());
         setOpaque(false);
-
-        field = new JTextField(text);
-        field.setBorder(EDIT_BORDER);
-        ((AbstractDocument) field.getDocument()).setDocumentFilter(new LengthFilter(maxLength));
 
         label = new JLabel(text);
         // Text starting with <html> would otherwise be rendered as HTML, which can load remote images
         label.putClientProperty("html.disable", Boolean.TRUE);
-        label.setFont(field.getFont());
-        label.setBorder(IDLE_BORDER);
-        label.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
-        label.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent event) {
-                cards.show(InlineTextField.this, EDIT);
-                field.requestFocusInWindow();
-            }
-        });
 
-        field.addActionListener(e -> stopEditing());
+        field = new JTextField(text) {
+            @Override
+            protected void paintComponent(Graphics graphics) {
+                if (editing) {
+                    super.paintComponent(graphics);
+                    return;
+                }
+                Insets insets = getInsets();
+                SwingUtilities.paintComponent(graphics, label, this, insets.left, insets.top,
+                        getWidth() - insets.left - insets.right, getHeight() - insets.top - insets.bottom);
+            }
+        };
+        ((AbstractDocument) field.getDocument()).setDocumentFilter(new LengthFilter(maxLength));
+        label.setFont(field.getFont());
+        showIdle();
+
+        addListeners();
+        add(field, BorderLayout.CENTER);
+    }
+
+    private void addListeners() {
+        field.addActionListener(e -> commitEdit());
         field.addFocusListener(new FocusAdapter() {
             @Override
             public void focusGained(FocusEvent event) {
-                if (editing) {
-                    // Focus came back after a temporary loss; keep the edit and its caret as they were
-                    return;
+                // Not editing after a temporary loss means the edit was ended meanwhile; keep it ended
+                if (!editing && !event.isTemporary()) {
+                    startEdit();
                 }
-                editing = true;
-                field.selectAll();
-                Toolkit.getDefaultToolkit().addAWTEventListener(clickAwayListener, AWTEvent.MOUSE_EVENT_MASK);
-                onEditingChanged.accept(true);
             }
 
             @Override
             public void focusLost(FocusEvent event) {
-                // A temporary loss is e.g. switching to another window; the field gets focus back with the client.
-                // Not editing means the edit was already dropped by removeNotify().
-                if (event.isTemporary() || !editing) {
+                // A temporary loss is e.g. switching to another window; the field gets focus back with the client
+                if (event.isTemporary()) {
                     return;
                 }
-                if (!field.isDisplayable()) {
-                    dropEdit();
-                    return;
-                }
-                editing = false;
-                Toolkit.getDefaultToolkit().removeAWTEventListener(clickAwayListener);
-                String value = field.getText().trim();
-                if (value.equals(text) || !onCommit.test(value)) {
-                    field.setText(text);
+                if (field.isDisplayable()) {
+                    commitEdit();
                 } else {
-                    // Show the new value until the panel is rebuilt with it
-                    label.setText(value);
+                    dropEdit();
                 }
-                cards.show(InlineTextField.this, IDLE);
-                onEditingChanged.accept(false);
             }
         });
-        field.registerKeyboardAction(e -> {
-                    field.setText(text);
-                    stopEditing();
-                },
-                KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_FOCUSED);
-
-        add(label, IDLE);
-        add(field, EDIT);
-        cards.show(this, IDLE);
+        field.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent event) {
+                // Enter and Escape end the edit but leave the field focused, so no focus gain follows a click
+                if (!editing && field.isFocusOwner()) {
+                    startEdit();
+                }
+            }
+        });
+        KeyBindings.bind(field, JComponent.WHEN_FOCUSED, KeyEvent.VK_ESCAPE, "cancelEdit", this::dropEdit);
     }
 
-    private JTextField getField() {
-        return field;
+    private void startEdit() {
+        editing = true;
+        field.setEditable(true);
+        field.setOpaque(true);
+        field.setBorder(EDIT_BORDER);
+        field.getCaret().setVisible(true);
+        field.selectAll();
+        field.repaint();
+        onEditingChanged.accept(true);
     }
 
-    /**
-     * Drops focus instead of passing it to the next component; focus loss commits the edit.
-     */
-    private void stopEditing() {
-        if (field.isFocusOwner()) {
-            KeyboardFocusManager.getCurrentKeyboardFocusManager().clearFocusOwner();
+    // Does nothing if the edit already ended, e.g. by Enter or Escape
+    private void commitEdit() {
+        if (!editing) {
+            return;
         }
+        String value = field.getText().trim();
+        if (value.equals(text) || !onCommit.test(value)) {
+            field.setText(text);
+        } else {
+            // Show the new value until the panel is rebuilt with it
+            label.setText(value);
+        }
+        endEdit();
     }
 
     /**
-     * Ends editing without committing, for when the field is removed mid-edit, e.g. the plugin was turned off.
+     * Ends editing without committing: Escape, or the field was removed mid-edit, e.g. the plugin was turned off.
      */
     private void dropEdit() {
-        editing = false;
-        Toolkit.getDefaultToolkit().removeAWTEventListener(clickAwayListener);
+        if (!editing) {
+            return;
+        }
         field.setText(text);
-        cards.show(this, IDLE);
+        endEdit();
+    }
+
+    private void endEdit() {
+        editing = false;
+        showIdle();
         onEditingChanged.accept(false);
+    }
+
+    private void showIdle() {
+        field.setEditable(false);
+        field.setOpaque(false);
+        field.setBorder(IDLE_BORDER);
+        field.getCaret().setVisible(false);
+        // Clears the selection, so the next edit starts from the beginning of the text
+        field.setCaretPosition(0);
+        field.repaint();
     }
 
     @Override
     public void removeNotify() {
         super.removeNotify();
         // If focus was temporarily elsewhere, e.g. in another window, no focus loss will follow to end the edit
-        if (editing) {
-            dropEdit();
-        }
+        dropEdit();
     }
 
     @Override
@@ -184,7 +187,7 @@ class InlineTextField extends JPanel {
     public void setForeground(Color color) {
         super.setForeground(color);
         // Called by the JPanel constructor before the children exist
-        if (label != null) {
+        if (field != null) {
             label.setForeground(color);
             field.setForeground(color);
         }
@@ -192,7 +195,7 @@ class InlineTextField extends JPanel {
 
     @Override
     public void setToolTipText(String text) {
-        label.setToolTipText(text);
+        field.setToolTipText(text);
     }
 
     private static final class LengthFilter extends DocumentFilter {

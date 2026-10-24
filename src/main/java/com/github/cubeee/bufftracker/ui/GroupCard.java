@@ -272,8 +272,7 @@ class GroupCard extends JPanel {
             addButton.setEnabled(false);
             addButton.setToolTipText("All buffs are already in this group");
         }
-        addButton.addActionListener(e -> BuffPicker.toggle(addButton, candidates, catalog,
-                buff -> actions.addBuff(group.getId(), buff)));
+        BuffPicker.attach(addButton, candidates, catalog, buff -> actions.addBuff(group.getId(), buff));
         return addButton;
     }
 
